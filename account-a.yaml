@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Cross-account canary verification - ACCOUNT A (front / canary). One stack, two tracks,
+  BOTH cross-account: (1) front: internet-facing ALB + weighted target groups - old EC2 in
+  this account (instance target), new EC2 in ACCOUNT B reached over VPC peering (IP target,
+  auto-accepted via account B's peer role); (2) backend: REST API + canary using VPC links V1
+  (NLB), canary overrides the connectionId stage variable. prod: VPC link 1 -> NLB-old ->
+  ALB-old -> Fargate(old). canary: VPC link 2 -> NLB-new -> interface endpoint ENIs ->
+  PrivateLink -> account B (NLB -> ALB -> Fargate new). Deploy 02-account-b.yaml FIRST, then
+  this stack, then UPDATE account B with this stack's PeeringConnectionId output (return
+  route), then register the endpoint ENI IPs into the new NLB target group by hand (README).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: canary-verify
+    Description: Prefix for named resources (tags, LB/target-group names). Keep <= 13 chars.
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >-
+      CIDR allowed to reach the front ALB (port 80) and to invoke the REST API.
+      Narrow this to your verification client's IP (e.g. 203.0.113.10/32) if possible.
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block (e.g. 203.0.113.10/32).
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the account A verification VPC.
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: Public subnet 1 CIDR (must be within VpcCidr).
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Public subnet 2 CIDR (must be within VpcCidr).
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  EndpointServiceName:
+    Type: String
+    Default: ''
+    Description: >-
+      Account B's VPC endpoint service name (com.amazonaws.vpce.<region>.vpce-svc-xxxx),
+      taken from 02-account-b.yaml output EndpointServiceName. Leave empty on a first
+      dry-run without account B; the interface endpoint is only created when this is set.
+  AccountBId:
+    Type: String
+    Default: ''
+    Description: 12-digit account ID of account B (peering requester needs the peer owner ID).
+    AllowedPattern: '^$|^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID or empty.
+  PeerVpcId:
+    Type: String
+    Default: ''
+    Description: >-
+      Account B's VPC ID (02-account-b.yaml output VpcId). Leave empty to skip the
+      front cross-account track; peering, routes and the front-new IP target are
+      only created when this is set (together with AccountBId / PeerRoleArn /
+      FrontNewWebPrivateIp).
+    AllowedPattern: '^$|^vpc-[0-9a-f]+$'
+  PeerRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Peering-accepter role ARN in account B (02-account-b.yaml output PeerRoleArn).
+      CloudFormation assumes it to auto-accept the cross-account peering connection.
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:iam::\d{12}:role/.+$'
+    ConstraintDescription: Must be an IAM role ARN (arn:aws:iam::<account-id>:role/...) or empty.
+  FrontNewWebPrivateIp:
+    Type: String
+    Default: ''
+    Description: >-
+      Private IP of the front web EC2 in account B (02-account-b.yaml output
+      FrontNewWebPrivateIp). Registered into the front-new target group as an IP
+      target reached over the peering.
+    AllowedPattern: '^$|^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+  AccountBVpcCidr:
+    Type: String
+    Default: 10.1.0.0/16
+    Description: >-
+      Account B's VPC CIDR (route destination over the peering). Must NOT overlap
+      with VpcCidr - VPC peering requires non-overlapping CIDRs.
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  ContainerImage:
+    Type: String
+    Default: public.ecr.aws/nginx/nginx:latest
+    Description: Public container image for the Fargate backend (must be pullable without auth).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (front web EC2), resolved via SSM public parameter.
+
+Conditions:
+  HasEndpointService: !Not [!Equals [!Ref EndpointServiceName, '']]
+  HasPeering: !Not [!Equals [!Ref PeerVpcId, '']]
+
+Resources:
+  # ==================================================================
+  # Shared network
+  # ==================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-a-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-a-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-a-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-a-public-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-a-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ==================================================================
+  # (1) Front web tier - ALB weighted target groups (EC2 old/new)
+  # ==================================================================
+  FrontAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Front ALB - allow HTTP from verification clients
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-front-alb-sg'
+
+  WebEc2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Front web EC2 - allow HTTP from the front ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref FrontAlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-web-ec2-sg'
+
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  FrontOldWebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebEc2SecurityGroup
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y nginx
+          TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          cat > /usr/share/nginx/html/index.html <<EOF
+          {"tier": "front", "environment": "old", "instance_id": "${INSTANCE_ID}"}
+          EOF
+          cat > /etc/nginx/conf.d/xenv.conf <<'EOF'
+          add_header X-Env "old" always;
+          add_header X-Tier "front" always;
+          EOF
+          systemctl enable --now nginx
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-front-web-old'
+
+  # The NEW front web EC2 lives in ACCOUNT B (02-account-b.yaml) and is reached
+  # over the VPC peering as an IP target - see FrontNewTargetGroup below.
+
+  FrontOldTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-front-old'
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      Targets:
+        - Id: !Ref FrontOldWebInstance
+          Port: 80
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  # IP-target group for the front web EC2 in ACCOUNT B, reached over the VPC
+  # peering. Cross-VPC targets require TargetType ip (instance targets are
+  # same-VPC only) and AvailabilityZone "all" for IPs outside the LB's VPC.
+  # Health checks stay unhealthy until the return route in account B is created
+  # (second update of 02-account-b.yaml with PeeringConnectionId).
+  FrontNewTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-front-new-ip'
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      Targets: !If
+        - HasPeering
+        - - Id: !Ref FrontNewWebPrivateIp
+            Port: 80
+            AvailabilityZone: all
+        - !Ref AWS::NoValue
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  # Cross-account VPC peering to account B. CloudFormation assumes PeerRoleArn
+  # in account B to auto-accept. Requires non-overlapping CIDRs.
+  VpcPeering:
+    Type: AWS::EC2::VPCPeeringConnection
+    Condition: HasPeering
+    Properties:
+      VpcId: !Ref Vpc
+      PeerVpcId: !Ref PeerVpcId
+      PeerOwnerId: !Ref AccountBId
+      PeerRoleArn: !Ref PeerRoleArn
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-peering-a-b'
+
+  RouteToAccountB:
+    Type: AWS::EC2::Route
+    Condition: HasPeering
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: !Ref AccountBVpcCidr
+      VpcPeeringConnectionId: !Ref VpcPeering
+
+  FrontAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Name: !Sub '${NamePrefix}-front-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref FrontAlbSecurityGroup
+
+  FrontHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref FrontAlb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontOldTargetGroup
+
+  # Weighted forward rule (old 100 / new 0). Change weights from the console
+  # during the verification (0% -> 50% -> 100%).
+  FrontWeightedRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref FrontHttpListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /*
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref FrontOldTargetGroup
+                Weight: 100
+              - TargetGroupArn: !Ref FrontNewTargetGroup
+                Weight: 0
+
+  # ==================================================================
+  # (2) Backend API tier - ECS Fargate (old) + VPC links + endpoint
+  # ==================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${NamePrefix}-a-cluster'
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${NamePrefix}-a-backend'
+      RetentionInDays: 7
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  # VPC link V1 ENIs are managed by API Gateway (no SG we can reference), and
+  # the NLBs run without security groups. Traffic reaching the backend ALB
+  # always originates inside this VPC, so allow HTTP from the VPC CIDR.
+  BackendAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend internal ALB - allow HTTP from within the VPC (NLB / VPC link)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-be-alb-sg'
+
+  BackendFargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend Fargate tasks - allow HTTP from the backend ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref BackendAlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-be-fargate-sg'
+
+  # ---- Old backend (ECS Fargate in this account) ----
+  OldBackendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${NamePrefix}-backend-old'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          EntryPoint:
+            - /bin/sh
+            - -c
+          Command:
+            - |
+              echo '{"tier":"backend","environment":"old","host":"'"$(hostname)"'"}' > /usr/share/nginx/html/index.html
+              printf 'add_header X-Env "old" always;\nadd_header X-Tier "backend" always;\n' > /etc/nginx/conf.d/00-xenv.conf
+              exec nginx -g 'daemon off;'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: old
+
+  OldBackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-be-old'
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  # ---- Old path: NLB-old -> ALB-old (ALB-type TG) -> Fargate(old) ----
+  # ALB-old keeps the base shape "ALB -> Fargate"; NLB-old in front of it is
+  # required because REST API VPC links V1 only target NLBs.
+  BackendAlbOld:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${NamePrefix}-be-alb-old'
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref BackendAlbSecurityGroup
+
+  BackendAlbOldListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref BackendAlbOld
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OldBackendTargetGroup
+
+  OldBackendService:
+    Type: AWS::ECS::Service
+    DependsOn: BackendAlbOldListener
+    Properties:
+      ServiceName: !Sub '${NamePrefix}-backend-old'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref OldBackendTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref BackendFargateSecurityGroup
+      LoadBalancers:
+        - TargetGroupArn: !Ref OldBackendTargetGroup
+          ContainerName: web
+          ContainerPort: 80
+
+  # NLB-old forwards TCP:80 to ALB-old via an ALB-type target group
+  # (same account / same VPC, which is the documented requirement).
+  NlbOldAlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-nlb-old-tg'
+      VpcId: !Ref Vpc
+      Protocol: TCP
+      Port: 80
+      TargetType: alb
+      Targets:
+        - Id: !Ref BackendAlbOld
+          Port: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  NlbOld:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${NamePrefix}-nlb-old'
+      Scheme: internal
+      Type: network
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  NlbOldListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NlbOld
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NlbOldAlbTargetGroup
+
+  # REST API VPC link V1 (NLB only). connectionId switching via a stage
+  # variable is the officially documented pattern, so the canary can swap
+  # VpcLinkOld -> VpcLinkNew. Creation takes several minutes.
+  VpcLinkOld:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+      Name: !Sub '${NamePrefix}-vpclink-v1-old'
+      TargetArns:
+        - !Ref NlbOld
+
+  # ---- New path: NLB-new -> IP targets = interface endpoint ENIs -> PrivateLink -> account B ----
+  # Target group is intentionally EMPTY here. After deploy, register the
+  # interface VPC endpoint ENI private IPs into it by hand (see README).
+  NewBackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-be-new-tcp'
+      VpcId: !Ref Vpc
+      Protocol: TCP
+      Port: 80
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  NlbNew:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${NamePrefix}-nlb-new'
+      Scheme: internal
+      Type: network
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  NlbNewListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NlbNew
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NewBackendTargetGroup
+
+  VpcLinkNew:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+      Name: !Sub '${NamePrefix}-vpclink-v1-new'
+      TargetArns:
+        - !Ref NlbNew
+
+  # Interface VPC endpoint to account B's PrivateLink service.
+  # Only created once EndpointServiceName is provided.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasEndpointService
+    Properties:
+      # Traffic arrives from NLB-new (no SG) / the VPC link ENIs, both inside
+      # this VPC, so allow HTTP from the VPC CIDR.
+      GroupDescription: Interface VPC endpoint - allow HTTP from within the VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-endpoint-sg'
+
+  ServiceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: HasEndpointService
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Ref EndpointServiceName
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  # ==================================================================
+  # API Gateway (REST) + canary-ready prod stage
+  # ==================================================================
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${NamePrefix}-api'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      # Public Regional endpoint, but invoke is limited to AllowedCidr.
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: 'execute-api:/*'
+            Condition:
+              IpAddress:
+                aws:SourceIp: !Ref AllowedCidr
+
+  # Private integration via VPC link V1. Routing is decided ONLY by
+  # connectionId (the VPC link -> its NLB); the uri is used for the Host
+  # header, not for routing (documented V1 behavior). Both are stage
+  # variables so the canary can swap them:
+  #   prod   : vpcLinkId = VpcLinkOld, backendHost = NLB-old DNS
+  #   canary : vpcLinkId = VpcLinkNew, backendHost = NLB-new DNS (console)
+  # connectionId-as-stage-variable is the officially documented pattern for
+  # V1 private integrations. (IntegrationTarget is a V2-only property and is
+  # not used here; it cannot be a stage variable, which is why V2 cannot
+  # canary-switch between ALBs.)
+  RootGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt RestApi.RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        ConnectionType: VPC_LINK
+        ConnectionId: '${stageVariables.vpcLinkId}'
+        Uri: 'http://${stageVariables.backendHost}'
+
+  # NOTE: bump the logical ID (ApiDeployment -> ApiDeployment2 -> ...) whenever
+  # you change the method/integration. A Deployment is an immutable snapshot;
+  # if this resource is unchanged, CloudFormation will NOT create a new
+  # deployment and the stage keeps serving the old API definition (a common
+  # API Gateway + CloudFormation gotcha).
+  ApiDeployment2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: RootGetMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ProdStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment2
+      StageName: prod
+      CacheClusterEnabled: false
+      Variables:
+        # prod routes to the old backend (VPC link 1 -> NLB-old -> ALB-old ->
+        # Fargate old). The canary overrides both variables to the new path.
+        vpcLinkId: !Ref VpcLinkOld
+        backendHost: !GetAtt NlbOld.DNSName
+
+Outputs:
+  FrontAlbDnsName:
+    Description: Front web tier - open http://<this>/ from the verification client (weighted TG old/new).
+    Value: !GetAtt FrontAlb.DNSName
+
+  PeeringConnectionId:
+    Description: >-
+      Pass this back to 02-account-b.yaml parameter PeeringConnectionId (second update)
+      to create the return route in account B.
+    Condition: HasPeering
+    Value: !Ref VpcPeering
+
+  ApiInvokeUrl:
+    Description: Backend API tier - GET this URL (canary switches old/new backend).
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  CanaryVpcLinkId:
+    Description: Set this as the "vpcLinkId" canary stage-variable override (new VPC link V1).
+    Value: !Ref VpcLinkNew
+
+  CanaryBackendHost:
+    Description: Set this as the "backendHost" canary stage-variable override (NLB-new DNS, Host header only).
+    Value: !GetAtt NlbNew.DNSName
+
+  NewBackendTargetGroupArn:
+    Description: Register the interface VPC endpoint ENI private IPs into this NLB target group by hand.
+    Value: !Ref NewBackendTargetGroup
+
+  ServiceEndpointId:
+    Description: >-
+      Interface VPC endpoint id. Look up its ENI private IPs
+      (aws ec2 describe-vpc-endpoints --> NetworkInterfaceIds --> describe-network-interfaces)
+      and register them into NewBackendTargetGroup.
+    Condition: HasEndpointService
+    Value: !Ref ServiceEndpoint
