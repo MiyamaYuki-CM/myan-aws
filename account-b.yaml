@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Cross-account canary/weighted-routing verification - ACCOUNT B (new environment).
+  Backend: NLB (ALB-type target group) -> internal ALB -> ECS Fargate (new), exposed to
+  account A via a VPC endpoint service (PrivateLink). Front: the NEW web EC2 lives here
+  and is reached from account A's front ALB via VPC peering (IP target), so it also
+  provides a peering-accepter IAM role and a conditional return route.
+  Deploy this stack FIRST, then 01-account-a.yaml, then UPDATE this stack once more with
+  PeeringConnectionId (output of the account A stack) to open the return route.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: canary-verify
+    Description: Prefix for named resources. Keep <= 13 chars. Match the account A stack.
+  AccountAId:
+    Type: String
+    Description: >-
+      12-digit account ID of account A (allowed to connect to the endpoint service and
+      trusted by the peering-accepter role).
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+  VpcCidr:
+    Type: String
+    Default: 10.1.0.0/16
+    Description: >-
+      CIDR block for the account B verification VPC. Must NOT overlap with account A's
+      VPC CIDR - VPC peering (front track) requires non-overlapping CIDRs.
+      (PrivateLink alone would tolerate overlap, peering does not.)
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.1.0.0/24
+    Description: Public subnet 1 CIDR (must be within VpcCidr).
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.1.1.0/24
+    Description: Public subnet 2 CIDR (must be within VpcCidr).
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  AccountAVpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >-
+      Account A's VPC CIDR. Used for (1) the front web EC2 security group ingress
+      (traffic and health checks arrive from account A's ALB nodes over the peering)
+      and (2) the return-route destination.
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+  PeeringConnectionId:
+    Type: String
+    Default: ''
+    Description: >-
+      VPC peering connection ID (pcx-xxxx) output by the account A stack. Leave empty on
+      the FIRST deploy (it does not exist yet); set it in a SECOND update of this stack
+      to create the return route to account A.
+    AllowedPattern: '^$|^pcx-[0-9a-f]+$'
+  ContainerImage:
+    Type: String
+    Default: public.ecr.aws/nginx/nginx:latest
+    Description: Public container image for the Fargate backend (must be pullable without auth).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (front web EC2), resolved via SSM public parameter.
+
+Conditions:
+  HasPeering: !Not [!Equals [!Ref PeeringConnectionId, '']]
+
+Resources:
+  # ==================================================================
+  # Network
+  # ==================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-public-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ==================================================================
+  # VPC peering (front track): accepter role + return route
+  # ==================================================================
+  # Account A's CloudFormation assumes this role to auto-accept the peering
+  # connection it creates (the documented cross-account peering pattern).
+  PeerAcceptRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AccountAId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: accept-vpc-peering
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:AcceptVpcPeeringConnection
+                Resource: '*'
+
+  # Return route to account A. Created only on the SECOND update of this stack,
+  # once the peering connection ID (created by the account A stack) is known.
+  # Until then the front-new target group in account A stays unhealthy.
+  RouteToAccountA:
+    Type: AWS::EC2::Route
+    Condition: HasPeering
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: !Ref AccountAVpcCidr
+      VpcPeeringConnectionId: !Ref PeeringConnectionId
+
+  # ==================================================================
+  # Front web tier (new) - EC2 reached from account A's ALB via peering
+  # ==================================================================
+  FrontWebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Front web EC2 (new) - allow HTTP from account A VPC (ALB nodes over peering)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AccountAVpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-front-web-sg'
+
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  FrontNewWebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref FrontWebSecurityGroup
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y nginx
+          TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          cat > /usr/share/nginx/html/index.html <<EOF
+          {"tier": "front", "environment": "new", "instance_id": "${INSTANCE_ID}"}
+          EOF
+          cat > /etc/nginx/conf.d/xenv.conf <<'EOF'
+          add_header X-Env "new" always;
+          add_header X-Tier "front" always;
+          EOF
+          systemctl enable --now nginx
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-front-web-new'
+
+  # ==================================================================
+  # ECS Fargate (new) behind an internal ALB  (base shape ALB -> Fargate)
+  # ==================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${NamePrefix}-b-cluster'
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${NamePrefix}-b-backend'
+      RetentionInDays: 7
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  # Permissive within the VPC on purpose: traffic arrives via PrivateLink ->
+  # NLB -> ALB, so the source presented to the ALB is inside this VPC.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: New internal ALB - allow HTTP from within the VPC (NLB / PrivateLink)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-alb-sg'
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: New Fargate tasks - allow HTTP from the ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-b-fargate-sg'
+
+  NewBackendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${NamePrefix}-backend-new'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          EntryPoint:
+            - /bin/sh
+            - -c
+          Command:
+            - |
+              echo '{"tier":"backend","environment":"new","host":"'"$(hostname)"'"}' > /usr/share/nginx/html/index.html
+              printf 'add_header X-Env "new" always;\nadd_header X-Tier "backend" always;\n' > /etc/nginx/conf.d/00-xenv.conf
+              exec nginx -g 'daemon off;'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: new
+
+  NewBackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-b-new'
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${NamePrefix}-b-alb'
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NewBackendTargetGroup
+
+  NewBackendService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      ServiceName: !Sub '${NamePrefix}-backend-new'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref NewBackendTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+      LoadBalancers:
+        - TargetGroupArn: !Ref NewBackendTargetGroup
+          ContainerName: web
+          ContainerPort: 80
+
+  # ==================================================================
+  # NLB (ALB-type target group) -> ALB, then expose via PrivateLink
+  # ==================================================================
+  AlbTypeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${NamePrefix}-b-albtg'
+      VpcId: !Ref Vpc
+      Protocol: TCP
+      Port: 80
+      TargetType: alb
+      Targets:
+        - Id: !Ref Alb
+          Port: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200'
+
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${NamePrefix}-b-nlb'
+      Scheme: internal
+      Type: network
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTypeTargetGroup
+
+  # ==================================================================
+  # PrivateLink endpoint service (fronted by the NLB), allowed to account A
+  # ==================================================================
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      NetworkLoadBalancerArns:
+        - !Ref Nlb
+      AcceptanceRequired: false
+
+  EndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref EndpointService
+      AllowedPrincipals:
+        - !Sub 'arn:${AWS::Partition}:iam::${AccountAId}:root'
+
+Outputs:
+  EndpointServiceName:
+    Description: Pass this to 01-account-a.yaml parameter EndpointServiceName.
+    Value: !Sub 'com.amazonaws.vpce.${AWS::Region}.${EndpointService}'
+
+  PeerRoleArn:
+    Description: Pass this to 01-account-a.yaml parameter PeerRoleArn (peering auto-accept).
+    Value: !GetAtt PeerAcceptRole.Arn
+
+  VpcId:
+    Description: Pass this to 01-account-a.yaml parameter PeerVpcId.
+    Value: !Ref Vpc
+
+  FrontNewWebPrivateIp:
+    Description: Pass this to 01-account-a.yaml parameter FrontNewWebPrivateIp (IP target for the front ALB).
+    Value: !GetAtt FrontNewWebInstance.PrivateIp
+
+  AlbDnsName:
+    Description: Internal ALB DNS (new env). Reachable only from within the VPC / via PrivateLink.
+    Value: !GetAtt Alb.DNSName
