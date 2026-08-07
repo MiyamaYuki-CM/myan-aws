@@ -1,0 +1,29 @@
+-- pgloader コマンドファイル（検証用）
+-- 実行前に以下をCFn（cfn/verify-environment.yaml）でデプロイした際の実際の値に置き換えること:
+--   <RDS_ENDPOINT>        … OutputsのRDSEndpoint
+--   <MASTER_PASSWORD>     … デプロイ時に指定したDBMasterPasswordパラメータの値
+--   <DB_MASTER_USERNAME>  … デプロイ時に指定したDBMasterUsernameパラメータの値（既定値: testadmin）
+-- DB名は cfn/verify-environment.yaml でパラメータ化されておらず "testdb" 固定のため、
+-- テンプレート側を変更しない限りここも "testdb" のままにすること。
+
+LOAD DATABASE
+     FROM sqlite:///data/sample.db
+     INTO postgresql://<DB_MASTER_USERNAME>:<MASTER_PASSWORD>@<RDS_ENDPOINT>:5432/testdb?sslmode=prefer
+
+WITH include drop, create tables, create indexes, reset sequences,
+     downcase identifiers
+
+SET work_mem to '16MB',
+    maintenance_work_mem to '512MB'
+
+-- 型マッピングの明示指定（シナリオ1・2の検証観点）。
+-- SQLiteのREAL(金額列)をPostgreSQLのnumericへ、
+-- SQLiteのTEXT日時列はpgloaderの標準推論に任せてtimestampへの自動変換結果を確認する。
+CAST type real to numeric using float-to-string
+
+BEFORE LOAD DO
+  $$ create schema if not exists public; $$
+
+AFTER LOAD DO
+  $$ COMMENT ON SCHEMA public IS 'sqlite-to-postgres migration verification'; $$
+;
