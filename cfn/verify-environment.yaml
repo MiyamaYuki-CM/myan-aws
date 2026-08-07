@@ -1,0 +1,514 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Disposable test environment for verifying the migration of a SQLite database
+  to Amazon RDS for PostgreSQL.
+  Delete the entire CloudFormation stack after completing the verification.
+  This template is intended for testing purposes only and is not a production configuration.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: test-sqlite-pg-migration
+    Description: Prefix used for resource names
+
+  DBMasterUsername:
+    Type: String
+    Default: testadmin
+    Description: Master username for the test database
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Master password for the test database. Specify a strong password.
+
+  DBEngineVersion:
+    Type: String
+    Default: '16.14'
+    Description: Amazon RDS for PostgreSQL engine version
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: Amazon RDS DB instance class
+
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type used as the migration work host
+
+  S3ObjectPrefix:
+    Type: String
+    Default: scripts/
+    Description: S3 object prefix that the EC2 instance is allowed to read
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID provided through Parameter Store
+
+Resources:
+
+  # ------------------------------------------------------------
+  # VPC
+  # ------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+        - Key: Environment
+          Value: test
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+        - Key: Environment
+          Value: test
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ------------------------------------------------------------
+  # Public subnet
+  #
+  # The EC2 migration work host is placed in this subnet.
+  # ------------------------------------------------------------
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-a
+        - Key: Environment
+          Value: test
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-route-table
+        - Key: Environment
+          Value: test
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn:
+      - VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  # ------------------------------------------------------------
+  # Private subnets
+  #
+  # The DB subnet group contains subnets in two Availability Zones.
+  # The RDS DB instance itself runs as a Single-AZ deployment.
+  #
+  # These subnets have no default route to an Internet Gateway.
+  # ------------------------------------------------------------
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-a
+        - Key: Environment
+          Value: test
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-b
+        - Key: Environment
+          Value: test
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-route-table
+        - Key: Environment
+          Value: test
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ------------------------------------------------------------
+  # Security groups
+  # ------------------------------------------------------------
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 migration work host
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - Description: Allow outbound communication
+          IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2-sg
+        - Key: Environment
+          Value: test
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the test PostgreSQL DB instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow PostgreSQL access from the EC2 migration work host
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rds-sg
+        - Key: Environment
+          Value: test
+
+  # ------------------------------------------------------------
+  # S3 bucket for migration scripts
+  #
+  # BucketName is intentionally omitted because S3 bucket names must
+  # be globally unique. CloudFormation automatically generates one.
+  # ------------------------------------------------------------
+
+  TransferBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-transfer-bucket
+        - Key: Purpose
+          Value: database-migration-file-transfer
+        - Key: Environment
+          Value: test
+
+  TransferBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TransferBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:*
+            Resource:
+              - !GetAtt TransferBucket.Arn
+              - !Sub ${TransferBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ------------------------------------------------------------
+  # Amazon RDS for PostgreSQL
+  # ------------------------------------------------------------
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group for the test PostgreSQL DB instance
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-subnet-group
+        - Key: Environment
+          Value: test
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-postgres
+
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBName: testdb
+
+      Port: 5432
+
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+
+      DBSubnetGroupName: !Ref DBSubnetGroup
+
+      # Place the Single-AZ RDS instance in the same AZ as the EC2 host.
+      AvailabilityZone: !Select [0, !GetAZs '']
+      PubliclyAccessible: false
+      MultiAZ: false
+
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-postgres
+        - Key: Purpose
+          Value: sqlite-to-postgresql-migration-test
+        - Key: Environment
+          Value: test
+
+  # ------------------------------------------------------------
+  # IAM resources for the EC2 migration work host
+  # ------------------------------------------------------------
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ec2-role
+      Description: IAM role for Session Manager and read-only access to migration files in S3
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+      Policies:
+        - PolicyName: ReadMigrationFilesFromS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListAllowedS3Prefix
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt TransferBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub ${S3ObjectPrefix}*
+
+              - Sid: ReadObjectsFromAllowedS3Prefix
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                Resource:
+                  - !Sub ${TransferBucket.Arn}/${S3ObjectPrefix}*
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2-role
+        - Key: Environment
+          Value: test
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # ------------------------------------------------------------
+  # EC2 migration work host
+  #
+  # The instance is placed in one public subnet.
+  # Access is provided through Systems Manager Session Manager.
+  # No inbound SSH rule is configured.
+  # ------------------------------------------------------------
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicRoute
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnetA
+
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+
+      IamInstanceProfile: !Ref EC2InstanceProfile
+
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            Encrypted: true
+            DeleteOnTermination: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-work-host
+        - Key: Purpose
+          Value: database-migration-test
+        - Key: Environment
+          Value: test
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+
+          exec > >(tee -a /var/log/migration-bootstrap.log) 2>&1
+
+          dnf update -y
+
+          dnf install -y \
+            sqlite \
+            postgresql16 \
+            python3 \
+            python3-pip \
+            docker
+
+          systemctl enable --now amazon-ssm-agent
+          systemctl enable --now docker
+
+          usermod -aG docker ec2-user
+
+          pip3 install psycopg2-binary
+
+          install -d \
+            -o ec2-user \
+            -g ec2-user \
+            -m 0755 \
+            /home/ec2-user/scripts
+
+          install -d \
+            -o ec2-user \
+            -g ec2-user \
+            -m 0755 \
+            /home/ec2-user/data
+
+          docker pull dimitri/pgloader:latest
+
+          aws --version
+          echo "Bootstrap completed successfully"
+
+Outputs:
+
+  TransferBucketName:
+    Description: S3 bucket used for migration scripts and files
+    Value: !Ref TransferBucket
+
+  TransferBucketArn:
+    Description: ARN of the S3 transfer bucket
+    Value: !GetAtt TransferBucket.Arn
+
+  S3ObjectPrefix:
+    Description: S3 prefix that the EC2 instance is allowed to read
+    Value: !Ref S3ObjectPrefix
+
+  ScriptUploadCommand:
+    Description: Example command for uploading the sample SQLite generator
+    Value: !Sub aws s3 cp scripts/generate_sample_sqlite.py s3://${TransferBucket}/${S3ObjectPrefix}generate_sample_sqlite.py
+
+  RDSEndpoint:
+    Description: Endpoint address of the test PostgreSQL DB instance
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  RDSPort:
+    Description: Port number of the test PostgreSQL DB instance
+    Value: !GetAtt RDSInstance.Endpoint.Port
+
+  DBName:
+    Description: Name of the test PostgreSQL database
+    Value: testdb
+
+  EC2InstanceId:
+    Description: EC2 instance ID used to start a Systems Manager session
+    Value: !Ref EC2Instance
+
+  StartSessionCommand:
+    Description: AWS CLI command for starting a Session Manager session
+    Value: !Sub aws ssm start-session --target ${EC2Instance}
