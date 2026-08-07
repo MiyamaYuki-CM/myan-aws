@@ -4,12 +4,16 @@
 「工事見積書OCR→経費仕訳自動分類→会計システム連携」アプリを想定した仮想スキーマに
 サンプル行を投入したSQLite DBファイルを作成する。
 実データ入手後は本スクリプトを使わず、実際の .db ファイルをそのまま検証対象とすること。
+
+なお total_amount 等の金額列はREALで保持しているが、これはSQLite→PostgreSQL移行時の
+型変換（REAL→numeric）の挙動を検証する目的であり、実システムでREALを金額の型として
+推奨する意図はない（丸め誤差の観点からnumeric/decimal相当の型を使うべき）。
 """
 import argparse
 import random
 import sqlite3
 import string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 SCHEMA = """
 CREATE TABLE vendors (
@@ -20,10 +24,10 @@ CREATE TABLE vendors (
 
 CREATE TABLE estimates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vendor_id INTEGER NOT NULL,  -- FK制約なし(PRAGMA foreign_keys=off運用想定)
+    vendor_id INTEGER NOT NULL,  -- あえてREFERENCESを書いていない(移行後にFKを追加するシナリオを検証するため)
     estimate_no TEXT NOT NULL,
     estimate_date TEXT NOT NULL,      -- ISO8601文字列 (例: '2026-07-15')
-    total_amount REAL NOT NULL,
+    total_amount REAL NOT NULL,  -- 型変換検証用にREALで保持(実システムでのREAL採用を推奨するものではない)
     ocr_confidence REAL,
     is_reviewed INTEGER NOT NULL DEFAULT 0,  -- 真偽値をINTEGER 0/1で表現
     created_at_epoch INTEGER NOT NULL,       -- UNIXエポック秒
@@ -79,7 +83,7 @@ def build(conn, rows):
     for name in VENDOR_NAMES:
         cur.execute(
             "INSERT INTO vendors (name, created_at) VALUES (?, ?)",
-            (name, (datetime(2025, 1, 1) + timedelta(days=random.randint(0, 500))).isoformat()),
+            (name, (datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=random.randint(0, 500))).isoformat()),
         )
 
     for code, name in EXPENSE_CATEGORIES:
@@ -90,7 +94,7 @@ def build(conn, rows):
     vendor_ids = [r[0] for r in cur.execute("SELECT id FROM vendors")]
     category_ids = [r[0] for r in cur.execute("SELECT id FROM expense_categories")]
 
-    base_date = datetime(2026, 1, 1)
+    base_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for i in range(rows):
         vendor_id = random.choice(vendor_ids)
         est_date = base_date + timedelta(days=random.randint(0, 200))
@@ -107,7 +111,7 @@ def build(conn, rows):
                 total_amount,  # 後で明細合計にUPDATE
                 round(random.uniform(0.75, 0.99), 4),
                 random.choice([0, 1]),
-                int(est_date.timestamp()),
+                int(est_date.timestamp()),  # UTC固定(実行環境のローカルTZに依存させない)
                 bytes([random.randint(0, 255) for _ in range(32)]),  # ダミーサムネイル
             ),
         )

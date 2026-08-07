@@ -10,9 +10,13 @@ LOAD DATABASE
      FROM sqlite:///data/sample.db
      INTO postgresql://<DB_MASTER_USERNAME>:<MASTER_PASSWORD>@<RDS_ENDPOINT>:5432/testdb?sslmode=prefer
 
+-- include drop は対象テーブルをCASCADEで削除するため、検証用の空DBでのみ使うこと。
+-- 既存データが入った本番DBに対して実行しないこと。
 WITH include drop, create tables, create indexes, reset sequences,
      downcase identifiers
 
+-- work_mem / maintenance_work_mem はインスタンスのメモリ量と並列度に応じて調整すること。
+-- この値（検証用のdb.t3.micro向け）をそのまま本番へ持ち込まないこと。
 SET work_mem to '16MB',
     maintenance_work_mem to '512MB'
 
