@@ -1,4 +1,4 @@
-# このリポジトリは
+# README.md
 SQLiteからRDS for PostgreSQLへの移行検証に使用したCloudFormationのテンプレート、各種スクリプトを格納しています。
 
 # SQLite → RDS for PostgreSQL 移行検証キット（pgloader）
