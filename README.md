@@ -5,7 +5,7 @@ SQLiteからRDS for PostgreSQLへの移行検証に使用したCloudFormationの
 
 SQLiteで運用しているデータベースを、Amazon RDS for PostgreSQL へ移行できるかを検証するための使い捨て検証環境（CloudFormation）と、検証用スクリプト一式です。
 
-[ブログ記事: SQLiteからRDS for PostgreSQLへの移行をpgloaderで検証してみた（ハマりどころ全部載せ）](<ブログ公開後にURLを追記>) の手順で使用したファイルをそのまま公開しています。
+[ブログ記事: SQLiteからRDS for PostgreSQLへの移行をpgloaderで検証してみた](https://dev.classmethod.jp/articles/myan-aws-sqlite-rds-verify/) の手順で使用したファイルをそのまま公開しています。
 
 ## 概要
 
