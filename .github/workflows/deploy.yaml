@@ -1,0 +1,80 @@
+name: Deploy to ECS (verification)
+
+on:
+  push:
+    tags:
+      - 'stg-*'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: aikoumuten-crm-stg-app
+  ECS_CLUSTER: aikoumuten-crm-stg-cluster
+  ECS_SERVICE: aikoumuten-crm-stg-service
+  ECS_TASK_FAMILY: aikoumuten-crm-stg-task
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<AWSアカウントID>:role/aikoumuten-crm-stg-github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push nginx image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.ref_name }}-nginx
+        run: |
+          docker build --target nginx -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Build, tag, and push php-fpm image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.ref_name }}-php-fpm
+        run: |
+          docker build --target php-fpm -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $ECS_TASK_FAMILY \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Render task definition (nginxコンテナのimage差し替え)
+        id: render-nginx
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: nginx
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}-nginx
+
+      - name: Render task definition (php-fpmコンテナのimage差し替え)
+        id: render-php-fpm
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-nginx.outputs.task-definition }}
+          container-name: php-fpm
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.ref_name }}-php-fpm
+
+      - name: Deploy to ECS (rolling update)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-php-fpm.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
